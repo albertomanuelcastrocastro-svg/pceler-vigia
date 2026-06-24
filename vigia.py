@@ -1,24 +1,15 @@
 """
-PCELER VIGÍA — Mensajero del Acelerómetro PALMERO
+PCELER VIGÍA — Mensajero del Acelerómetro PALMERO (v1.1)
 ====================================================
 Servicio que cada N minutos consulta a PCELER y envía las nuevas señales
-detectadas a Telegram. Guarda log de señales enviadas en GitHub para
-evitar duplicados y para que el bot principal las muestre en el panel.
+detectadas a Telegram.
 
-Funcionamiento:
-  1. Cada INTERVALO_SEGUNDOS pregunta a PCELER por señales en 15M
-     (con filtro 4H, umbral 0.25) para XRP y SOL
-  2. Compara con signals_log_pceler.json (en GitHub)
-  3. Si hay señal NUEVA confirmada, envía a Telegram
-  4. Actualiza signals_log_pceler.json en GitHub
-
-Variables de entorno requeridas (Railway):
-  - TELEGRAM_BOT_TOKEN: token de @PalmeroAgent_bot
-  - TELEGRAM_CHAT_ID: 5448802464
-  - GITHUB_TOKEN: PAT con permiso de contents:write sobre pceler-vigia
-  - GITHUB_REPO: albertomanuelcastrocastro-svg/pceler-vigia
-  - PCELER_URL: https://pceler-production.up.railway.app
-  - INTERVALO_SEGUNDOS: 300 (5 minutos por defecto)
+v1.1: corrige el problema de la inundación de mensajes en el primer arranque.
+  - Al arrancar por primera vez (log vacío), marca TODAS las señales históricas
+    como ya conocidas SIN enviarlas. El Vigía solo vigila desde su nacimiento.
+  - Filtro temporal: solo se consideran "nuevas" las señales cuyo timestamp
+    sea de los últimos 20 minutos. Las históricas se descartan siempre.
+  - Notificación de arranque en Telegram para confirmar inicio.
 """
 
 import os
@@ -26,7 +17,7 @@ import time
 import json
 import base64
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from threading import Thread
 from flask import Flask, jsonify
 
@@ -42,17 +33,19 @@ GITHUB_REPO = os.environ.get("GITHUB_REPO", "albertomanuelcastrocastro-svg/pcele
 PCELER_URL = os.environ.get("PCELER_URL", "https://pceler-production.up.railway.app")
 INTERVALO_SEGUNDOS = int(os.environ.get("INTERVALO_SEGUNDOS", "300"))
 
+VENTANA_FRESCURA_MINUTOS = int(os.environ.get("VENTANA_FRESCURA_MINUTOS", "20"))
+
 SIMBOLOS = ["XRPUSDT", "SOLUSDT"]
 TF_OBJETIVO = "15m"
 UMBRAL_OBJETIVO = "0.25"
 LOG_FILENAME = "signals_log_pceler.json"
 
-# Estado en memoria (cache del log)
 _estado = {
     "ultima_consulta": None,
     "ultima_senal_enviada": None,
     "total_consultas": 0,
     "total_senales_enviadas": 0,
+    "primer_arranque": True,
     "ultimos_errores": [],
 }
 
@@ -61,7 +54,6 @@ _estado = {
 # UTILIDADES GITHUB
 # ============================================================
 def github_get_file(filename):
-    """Lee un archivo del repo, devuelve (contenido_dict, sha) o (None, None)"""
     if not GITHUB_TOKEN:
         return None, None
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}"
@@ -87,7 +79,6 @@ def github_get_file(filename):
 
 
 def github_put_file(filename, content, sha=None, mensaje="actualizar log"):
-    """Crea o actualiza un archivo del repo"""
     if not GITHUB_TOKEN:
         return False
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}"
@@ -96,10 +87,7 @@ def github_put_file(filename, content, sha=None, mensaje="actualizar log"):
         "Accept": "application/vnd.github+json",
     }
     content_b64 = base64.b64encode(json.dumps(content, indent=2).encode("utf-8")).decode("utf-8")
-    body = {
-        "message": mensaje,
-        "content": content_b64,
-    }
+    body = {"message": mensaje, "content": content_b64}
     if sha:
         body["sha"] = sha
     try:
@@ -114,16 +102,11 @@ def github_put_file(filename, content, sha=None, mensaje="actualizar log"):
 # TELEGRAM
 # ============================================================
 def enviar_telegram(mensaje):
-    """Envía un mensaje al chat de Telegram configurado"""
     if not TELEGRAM_BOT_TOKEN:
         print("[telegram] Sin token, no se envía")
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    body = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": mensaje,
-        "parse_mode": "HTML",
-    }
+    body = {"chat_id": TELEGRAM_CHAT_ID, "text": mensaje, "parse_mode": "HTML"}
     try:
         r = requests.post(url, json=body, timeout=10)
         return r.status_code == 200
@@ -133,7 +116,6 @@ def enviar_telegram(mensaje):
 
 
 def formato_mensaje_telegram(senal):
-    """Formato igual al de P15"""
     tipo = senal.get("tipo", "?")
     simbolo = senal.get("simbolo", "?")
     precio = senal.get("precio", "?")
@@ -152,8 +134,22 @@ def formato_mensaje_telegram(senal):
 # ============================================================
 # LÓGICA DEL VIGÍA
 # ============================================================
+def es_senal_fresca(senal, ventana_minutos=VENTANA_FRESCURA_MINUTOS):
+    """Una señal es fresca si su timestamp es de los últimos N minutos"""
+    ts_str = senal.get("timestamp")
+    if not ts_str:
+        return False
+    try:
+        ts_dt = datetime.fromisoformat(ts_str)
+        ahora = datetime.now(timezone.utc)
+        edad = ahora - ts_dt
+        return edad <= timedelta(minutes=ventana_minutos)
+    except Exception as e:
+        print(f"[es_senal_fresca] Error parseando timestamp '{ts_str}': {e}")
+        return False
+
+
 def obtener_senales_pceler(simbolo):
-    """Consulta a PCELER las señales del umbral objetivo con filtro 4H"""
     url = f"{PCELER_URL}/senales/{simbolo}/{TF_OBJETIVO}"
     try:
         r = requests.get(url, timeout=20)
@@ -174,35 +170,87 @@ def obtener_senales_pceler(simbolo):
         return []
 
 
-def es_senal_nueva(senal, log_existente):
-    """Una señal es nueva si su timestamp + tipo + simbolo no está ya en el log"""
+def es_senal_ya_registrada(senal, log_existente):
     clave = f"{senal.get('simbolo')}|{senal.get('tipo')}|{senal.get('timestamp')}"
     for entry in log_existente:
         clave_log = f"{entry.get('simbolo')}|{entry.get('tipo')}|{entry.get('timestamp')}"
         if clave == clave_log:
-            return False
-    return True
+            return True
+    return False
+
+
+def primer_arranque_marcar_historico():
+    print("[primer_arranque] Comprobando log existente...")
+    log_actual, sha = github_get_file(LOG_FILENAME)
+    if log_actual is None:
+        print("[primer_arranque] No se pudo leer el log. Reintentando en próximo ciclo.")
+        return False
+
+    if len(log_actual) > 0:
+        print(f"[primer_arranque] Log ya tiene {len(log_actual)} señales. No es primer arranque.")
+        _estado["primer_arranque"] = False
+        return True
+
+    print("[primer_arranque] Log vacío. Marcando histórico como conocido...")
+    historico = []
+    for simbolo in SIMBOLOS:
+        senales = obtener_senales_pceler(simbolo)
+        for s in senales:
+            entry = {
+                "simbolo": s.get("simbolo"),
+                "tipo": s.get("tipo"),
+                "timestamp": s.get("timestamp"),
+                "precio": s.get("precio"),
+                "marcado_como_historico_utc": datetime.now(timezone.utc).isoformat(),
+            }
+            historico.append(entry)
+
+    ok = github_put_file(LOG_FILENAME, historico, sha=sha,
+        mensaje=f"primer arranque: marcadas {len(historico)} señales como histórico")
+    if ok:
+        print(f"[primer_arranque] OK. Marcadas {len(historico)} señales como histórico.")
+        _estado["primer_arranque"] = False
+        mensaje_arranque = (
+            f"🟠 <b>PCELER VIGÍA iniciado</b>\n"
+            f"⚙️ Monitorizando XRP y SOL en 15M\n"
+            f"⏱ Intervalo: {INTERVALO_SEGUNDOS//60} min\n"
+            f"📦 {len(historico)} señales históricas marcadas (no se envían)\n"
+            f"🟢 A partir de ahora solo señales nuevas\n"
+            f"🕐 {datetime.now(timezone.utc).isoformat()}"
+        )
+        enviar_telegram(mensaje_arranque)
+        return True
+    else:
+        print("[primer_arranque] ERROR guardando histórico.")
+        return False
 
 
 def ciclo_vigia():
-    """Un ciclo completo: consulta, detecta, envía, actualiza log"""
     _estado["total_consultas"] += 1
     _estado["ultima_consulta"] = datetime.now(timezone.utc).isoformat()
 
+    if _estado["primer_arranque"]:
+        ok = primer_arranque_marcar_historico()
+        if not ok:
+            return
+
     log_actual, sha = github_get_file(LOG_FILENAME)
     if log_actual is None:
-        print("[ciclo] No se pudo leer log de GitHub. Saltando ciclo.")
+        print("[ciclo] No se pudo leer log. Saltando.")
         return
 
     senales_nuevas = []
     for simbolo in SIMBOLOS:
         senales = obtener_senales_pceler(simbolo)
         for s in senales:
-            if es_senal_nueva(s, log_actual):
-                senales_nuevas.append(s)
+            if not es_senal_fresca(s):
+                continue
+            if es_senal_ya_registrada(s, log_actual):
+                continue
+            senales_nuevas.append(s)
 
     if not senales_nuevas:
-        print(f"[ciclo] Sin señales nuevas")
+        print(f"[ciclo] Sin señales nuevas frescas")
         return
 
     for s in senales_nuevas:
@@ -222,8 +270,8 @@ def ciclo_vigia():
 
 
 def loop_vigia():
-    """Hilo en bucle: ejecuta ciclo cada INTERVALO_SEGUNDOS"""
     print(f"[vigia] Iniciado. Intervalo: {INTERVALO_SEGUNDOS}s")
+    time.sleep(10)
     while True:
         try:
             ciclo_vigia()
@@ -241,10 +289,12 @@ def loop_vigia():
 def home():
     return jsonify({
         "servicio": "PCELER VIGÍA",
-        "version": "1.0",
+        "version": "1.1",
         "descripcion": "Mensajero entre PCELER y Telegram",
+        "correccion_v11": "primer arranque marca histórico sin enviarlo; filtro de frescura 20min",
         "configuracion": {
             "intervalo_segundos": INTERVALO_SEGUNDOS,
+            "ventana_frescura_minutos": VENTANA_FRESCURA_MINUTOS,
             "simbolos": SIMBOLOS,
             "tf_objetivo": TF_OBJETIVO,
             "umbral_objetivo": UMBRAL_OBJETIVO,
@@ -257,9 +307,10 @@ def home():
         "estado": _estado,
         "endpoints": [
             "/ — esta página",
-            "/log — ver log de señales enviadas",
+            "/log — ver log de señales",
             "/ciclo — ejecutar un ciclo manualmente",
-            "/test_telegram — enviar un mensaje de prueba a Telegram",
+            "/test_telegram — enviar mensaje de prueba",
+            "/reset_historico — borra el log y marca histórico actual (uso solo manual)",
         ],
     })
 
@@ -270,8 +321,8 @@ def ver_log():
     if log_actual is None:
         return jsonify({"error": "no se pudo leer el log"}), 500
     return jsonify({
-        "n_senales_enviadas": len(log_actual),
-        "senales": log_actual[-30:],
+        "n_entradas": len(log_actual),
+        "ultimas_30": log_actual[-30:],
     })
 
 
@@ -295,8 +346,28 @@ def test_telegram():
     return jsonify({"telegram_ok": ok})
 
 
+@app.route("/reset_historico")
+def reset_historico():
+    _, sha = github_get_file(LOG_FILENAME)
+    historico = []
+    for simbolo in SIMBOLOS:
+        senales = obtener_senales_pceler(simbolo)
+        for s in senales:
+            entry = {
+                "simbolo": s.get("simbolo"),
+                "tipo": s.get("tipo"),
+                "timestamp": s.get("timestamp"),
+                "precio": s.get("precio"),
+                "marcado_como_historico_utc": datetime.now(timezone.utc).isoformat(),
+            }
+            historico.append(entry)
+    ok = github_put_file(LOG_FILENAME, historico, sha=sha,
+        mensaje=f"RESET: marcadas {len(historico)} señales como histórico")
+    return jsonify({"ok": ok, "n_marcadas": len(historico)})
+
+
 # ============================================================
-# ARRANQUE: lanzar el hilo del vigía
+# ARRANQUE
 # ============================================================
 def arrancar_vigia():
     t = Thread(target=loop_vigia, daemon=True)
