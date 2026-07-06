@@ -1,34 +1,16 @@
 """
 
-PCELER VIGÍA — Mensajero del Acelerómetro PALMERO (v1.2)
+PCELER VIGÍA — Mensajero del Acelerómetro PALMERO (v1.4)
 
 ====================================================
 
-Servicio que cada N minutos consulta a PCELER y envía las nuevas señales
-
-detectadas a Telegram.
+v1.4: aumenta timeout de PCELER a 45s para evitar errores SOL
 
 v1.3: añade ping a PCELER en cada ciclo para evitar idle de Railway
 
 v1.2: cambia a lógica SIMPLIFICADA (cambio de signo) en vez de percentiles.
 
-  - Usa /senales_simple en vez de /senales (percentiles).
-
-  - Las señales aparecen inmediatamente al cierre de vela (no con retraso).
-
-  - Esto permite que el filtro de frescura funcione correctamente.
-
 v1.1: corrige el problema de la inundación de mensajes en el primer arranque.
-
-  - Al arrancar por primera vez (log vacío), marca TODAS las señales históricas
-
-    como ya conocidas SIN enviarlas. El Vigía solo vigila desde su nacimiento.
-
-  - Filtro temporal: solo se consideran "nuevas" las señales cuyo timestamp
-
-    sea de los últimos N minutos (configurable). Las históricas se descartan.
-
-  - Notificación de arranque en Telegram para confirmar inicio.
 
 """
 
@@ -248,8 +230,6 @@ def formato_mensaje_telegram(senal):
 
 def es_senal_fresca(senal, ventana_minutos=VENTANA_FRESCURA_MINUTOS):
 
-    """Una señal es fresca si su timestamp es de los últimos N minutos"""
-
     ts_str = senal.get("timestamp")
 
     if not ts_str:
@@ -278,7 +258,7 @@ def obtener_senales_pceler(simbolo):
 
     try:
 
-        r = requests.get(url, timeout=20)
+        r = requests.get(url, timeout=45)  # v1.4: aumentado de 20 a 45 segundos
 
         if r.status_code != 200:
 
@@ -378,7 +358,7 @@ def primer_arranque_marcar_historico():
 
         mensaje_arranque = (
 
-            f"🟠 <b>PCELER VIGÍA iniciado</b>\n"
+            f"🟠 <b>PCELER VIGÍA v1.4 iniciado</b>\n"
 
             f"⚙️ Monitorizando XRP y SOL en 15M\n"
 
@@ -403,11 +383,15 @@ def primer_arranque_marcar_historico():
         return False
 
 def ping_pceler():
-    """Mantiene PCELER despierto con un ping silencioso."""
+
     try:
+
         requests.get(f"{PCELER_URL}/paper", timeout=5)
+
         print("[ping] PCELER despertado")
+
     except:
+
         pass
 
 def ciclo_vigia():
@@ -520,11 +504,11 @@ def home():
 
         "servicio": "PCELER VIGÍA",
 
-        "version": "1.3",
+        "version": "1.4",
 
         "descripcion": "Mensajero entre PCELER y Telegram (lógica simplificada)",
 
-        "correccion_v12": "cambio a lógica simple (cambio de signo) para señales inmediatas",
+        "correccion_v14": "timeout PCELER aumentado a 45s para evitar errores SOL",
 
         "configuracion": {
 
@@ -606,7 +590,7 @@ def test_telegram():
 
     mensaje = (
 
-        f"🧪 <b>Test del PCELER VIGÍA</b>\n"
+        f"🧪 <b>Test del PCELER VIGÍA v1.4</b>\n"
 
         f"Si ves esto, la conexión con Telegram funciona.\n"
 
